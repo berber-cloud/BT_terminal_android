@@ -30,48 +30,25 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Fix android/app/build.gradle.kts
+      - name: Verify build.gradle.kts exists
         run: |
-          cat > android/app/build.gradle.kts << 'EOF'
-          plugins {
-              id("com.android.application")
-              id("kotlin-android")
-              id("dev.flutter.flutter-gradle-plugin")
-          }
-          
-          android {
-              namespace = "com.example.bt_terminal"
-              compileSdk = flutter.compileSdkVersion
-              ndkVersion = flutter.ndkVersion
-          
-              compileOptions {
-                  sourceCompatibility = JavaVersion.VERSION_17
-                  targetCompatibility = JavaVersion.VERSION_17
-              }
-          
-              kotlinOptions {
-                  jvmTarget = "17"
-              }
-          
-              defaultConfig {
-                  applicationId = "com.example.bt_terminal"
-                  minSdk = 23
-                  targetSdk = flutter.targetSdkVersion
-                  versionCode = 1
-                  versionName = "1.0.0"
-              }
-          
-              buildTypes {
-                  release {
-                      signingConfig = signingConfigs.getByName("debug")
-                  }
-              }
-          }
-          
-          flutter {
-              source = "../.."
-          }
-          EOF
+          if [ ! -f android/app/build.gradle.kts ]; then
+            echo "Error: build.gradle.kts not found"
+            exit 1
+          fi
+
+      - name: Patch build.gradle.kts
+        run: |
+          # Fix jvmTarget
+          sed -i 's/jvmTarget = JavaVersion.VERSION_17.toString()/jvmTarget = "17"/g' android/app/build.gradle.kts
+          # Fix versionCode and versionName (replace flutter.versionCode with 1 and flutter.versionName with "1.0.0")
+          sed -i 's/versionCode = flutter\.versionCode/versionCode = 1/g' android/app/build.gradle.kts
+          sed -i 's/versionName = flutter\.versionName/versionName = "1.0.0"/g' android/app/build.gradle.kts
+          # If there is no minSdk setting, add it under defaultConfig
+          grep -q 'minSdk' android/app/build.gradle.kts || \
+            sed -i '/defaultConfig {/a\        minSdk = 23' android/app/build.gradle.kts
+          # Print file for debugging
+          cat android/app/build.gradle.kts
 
       - name: Get dependencies
         run: flutter pub get
