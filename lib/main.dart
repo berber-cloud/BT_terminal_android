@@ -3,7 +3,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() => runApp(BtTerminalApp());
@@ -78,9 +78,10 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   // Bluetooth
-  BluetoothConnection? _connection;
+  BluetoothDevice? _device;
+  BluetoothCharacteristic? _txCharacteristic;
+  BluetoothCharacteristic? _rxCharacteristic;
   List<BluetoothDevice> _devices = [];
-  BluetoothDevice? _selectedDevice;
   String _status = 'Not connected';
   bool _connecting = false;
   String? _lastDeviceAddress;
@@ -92,6 +93,11 @@ class _HomeScreenState extends State<HomeScreen> {
   // Terminal log
   final List<String> _log = [];
 
+  // Подписки
+  StreamSubscription? _scanSubscription;
+  StreamSubscription? _connectionSubscription;
+  StreamSubscription? _rxSubscription;
+
   @override
   void initState() {
     super.initState();
@@ -102,48 +108,104 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
-    _connection?.dispose();
+    _scanSubscription?.cancel();
+    _connectionSubscription?.cancel();
+    _rxSubscription?.cancel();
+    _device?.disconnect();
     super.dispose();
   }
 
   // ---------------- Инициализация Bluetooth ----------------
-  Future<void> _initBluetooth() async {
-    try {
-      await FlutterBluetoothSerial.instance.requestEnable();
-      final bonded = await FlutterBluetoothSerial.instance.getBondedDevices();
-      setState(() => _devices = bonded);
-      FlutterBluetoothSerial.instance
-          .onStateChanged()
-          .listen((state) { /* можно обновить статус */ });
-    } catch (e) {
-      _showError(e.toString());
+  void _initBluetooth() {
+    // Слушаем состояние адаптера
+    FlutterBluePlus.adapterState.listen((state) {
+      if (state == BluetoothAdapterState.on) {
+        _startScan();
+      }
+    });
+    // Если адаптер уже включен — начинаем сканирование
+    if (FlutterBluePlus.adapterStateNow == BluetoothAdapterState.on) {
+      _startScan();
     }
   }
 
+  void _startScan() {
+    _devices.clear();
+    FlutterBluePlus.startScan(timeout: const Duration(seconds: 15));
+    _scanSubscription = FlutterBluePlus.onScanResults.listen((results) {
+      for (ScanResult r in results) {
+        if (!_devices.any((d) => d.remoteId == r.device.remoteId)) {
+          setState(() => _devices.add(r.device));
+        }
+      }
+    });
+  }
+
   Future<void> _connectToDevice(BluetoothDevice device) async {
-    if (_connection != null && _connection!.isConnected) {
-      await _connection!.close();
+    if (_device != null) {
+      await _device!.disconnect();
     }
     setState(() {
       _connecting = true;
       _status = 'Connecting...';
     });
     try {
-      final conn = await BluetoothConnection.toAddress(device.address);
+      // Подключаемся
+      await device.connect(timeout: const Duration(seconds: 15));
       setState(() {
-        _connection = conn;
-        _selectedDevice = device;
-        _status = 'Connected to ${device.name ?? device.address}';
-        _lastDeviceAddress = device.address;
+        _device = device;
+        _status = 'Discovering services...';
+      });
+
+      // Ищем сервисы
+      List<BluetoothService> services = await device.discoverServices();
+      BluetoothCharacteristic? tx, rx;
+      // Ищем стандартный UART сервис (UUID: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E)
+      for (var service in services) {
+        for (var characteristic in service.characteristics) {
+          if (characteristic.uuid.toString() == '6E400002-B5A3-F393-E0A9-E50E24DCCA9E') {
+            tx = characteristic;
+          } else if (characteristic.uuid.toString() == '6E400003-B5A3-F393-E0A9-E50E24DCCA9E') {
+            rx = characteristic;
+          }
+        }
+      }
+      // Если не нашли, ищем любой write/notify
+      if (tx == null || rx == null) {
+        for (var service in services) {
+          for (var characteristic in service.characteristics) {
+            if (characteristic.properties.write) tx ??= characteristic;
+            if (characteristic.properties.notify) rx ??= characteristic;
+          }
+        }
+      }
+      if (tx == null) throw 'No writable characteristic found';
+
+      setState(() {
+        _txCharacteristic = tx;
+        _rxCharacteristic = rx;
+        _status = 'Connected to ${device.platformName}';
+        _lastDeviceAddress = device.remoteId.toString();
       });
       _saveLastDevice();
-      conn.input!.listen((data) {
-        final msg = utf8.decode(data);
-        setState(() => _log.add('← $msg'));
-      }).onDone(() {
-        if (mounted) {
-          setState(() => _status = 'Disconnected');
-          _connection = null;
+
+      // Подписываемся на входящие данные
+      if (rx != null) {
+        await rx.setNotifyValue(true);
+        _rxSubscription = rx.onValueReceived.listen((value) {
+          setState(() => _log.add('← ${utf8.decode(value)}'));
+        });
+      }
+
+      // Отслеживаем отключение
+      _connectionSubscription = device.connectionState.listen((state) {
+        if (state == BluetoothConnectionState.disconnected && mounted) {
+          setState(() {
+            _status = 'Disconnected';
+            _device = null;
+            _txCharacteristic = null;
+            _rxCharacteristic = null;
+          });
         }
       });
     } catch (e) {
@@ -159,27 +221,30 @@ class _HomeScreenState extends State<HomeScreen> {
       _showError('No last device saved');
       return;
     }
+    // Ищем устройство в списке
     final device = _devices.firstWhere(
-      (d) => d.address == _lastDeviceAddress,
-      orElse: () => BluetoothDevice(address: _lastDeviceAddress!),
+      (d) => d.remoteId.toString() == _lastDeviceAddress,
+      orElse: () => throw 'Device not found',
     );
     await _connectToDevice(device);
   }
 
   void _disconnect() async {
-    await _connection?.close();
+    await _device?.disconnect();
     setState(() {
-      _connection = null;
+      _device = null;
+      _txCharacteristic = null;
+      _rxCharacteristic = null;
       _status = 'Disconnected';
     });
   }
 
   void _send(String data) async {
-    if (_connection == null || !_connection!.isConnected) {
+    if (_txCharacteristic == null) {
       _showError('Not connected');
       return;
     }
-    _connection!.output.add(utf8.encode(data));
+    await _txCharacteristic!.write(utf8.encode(data));
     setState(() => _log.add('→ $data'));
   }
 
@@ -356,7 +421,6 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           child: Column(
             children: [
-              // Полоса для перетаскивания
               Container(
                 margin: EdgeInsets.symmetric(vertical: 8),
                 width: 40,
@@ -366,7 +430,6 @@ class _HomeScreenState extends State<HomeScreen> {
                   borderRadius: BorderRadius.circular(2),
                 ),
               ),
-              // Лог
               Expanded(
                 child: ListView.builder(
                   controller: scrollCtrl,
@@ -377,7 +440,6 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
               ),
-              // Поле ввода
               Padding(
                 padding: const EdgeInsets.all(8.0),
                 child: Row(
@@ -390,17 +452,14 @@ class _HomeScreenState extends State<HomeScreen> {
                           contentPadding: EdgeInsets.symmetric(horizontal: 12),
                         ),
                         onSubmitted: (text) {
-                          if (text.isNotEmpty) {
-                            _send(text);
-                            Navigator.pop(ctx); // закрыть терминал? Можно оставить открытым
-                          }
+                          if (text.isNotEmpty) _send(text);
                         },
                       ),
                     ),
                     SizedBox(width: 8),
                     ElevatedButton(
                       onPressed: () {
-                        // Кнопка отправки – можно просто не закрывать
+                        // Пусто: отправка только по Enter в данном примере
                       },
                       child: Text('Send'),
                     ),
@@ -434,7 +493,7 @@ class _HomeScreenState extends State<HomeScreen> {
       int _sentCount = 0;
       return GestureDetector(
         onTapDown: (_) {
-          if (_connection == null || !_connection!.isConnected) {
+          if (_txCharacteristic == null) {
             _showError('Not connected');
             return;
           }
@@ -464,7 +523,7 @@ class _HomeScreenState extends State<HomeScreen> {
     } else if (isToggle) {
       return GestureDetector(
         onTap: () {
-          if (_connection == null || !_connection!.isConnected) {
+          if (_txCharacteristic == null) {
             _showError('Not connected');
             return;
           }
@@ -481,10 +540,9 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       );
     } else {
-      // normal
       return GestureDetector(
         onTap: () {
-          if (_connection == null || !_connection!.isConnected) {
+          if (_txCharacteristic == null) {
             _showError('Not connected');
             return;
           }
@@ -513,7 +571,7 @@ class _HomeScreenState extends State<HomeScreen> {
           onSelected: (device) => _connectToDevice(device),
           itemBuilder: (ctx) => _devices.map((d) => PopupMenuItem(
             value: d,
-            child: Text(d.name ?? d.address),
+            child: Text(d.platformName.isEmpty ? d.remoteId.toString() : d.platformName),
           )).toList(),
         ),
         actions: [
@@ -527,7 +585,7 @@ class _HomeScreenState extends State<HomeScreen> {
             tooltip: 'Open terminal',
             onPressed: _openTerminal,
           ),
-          if (_connection != null)
+          if (_device != null)
             IconButton(
               icon: Icon(Icons.close, color: Colors.red),
               tooltip: 'Disconnect',
@@ -538,20 +596,18 @@ class _HomeScreenState extends State<HomeScreen> {
           preferredSize: Size.fromHeight(4),
           child: _connecting
               ? LinearProgressIndicator()
-              : Container(height: 4, color: _connection != null ? Colors.green : Colors.red),
+              : Container(height: 4, color: _device != null ? Colors.green : Colors.red),
         ),
       ),
       body: Column(
         children: [
-          // Статус
           Padding(
             padding: const EdgeInsets.all(8.0),
             child: Text(_status, style: TextStyle(fontSize: 12, color: Colors.grey)),
           ),
-          // Сетка кнопок
           Expanded(
             child: _buttons.isEmpty
-                ? Center(child: Text('No buttons. Long press "+" to add.'))
+                ? Center(child: Text('No buttons. Tap "+" to add.'))
                 : GridView.builder(
                     padding: EdgeInsets.all(8),
                     gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
