@@ -17,7 +17,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Fix build.gradle.kts
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Fix android/app/build.gradle.kts
         run: |
           cat > android/app/build.gradle.kts << 'EOF'
           plugins {
@@ -58,26 +71,7 @@ jobs:
           flutter {
               source = "../.."
           }
-          
-          dependencies {
-              implementation("androidx.core:core-ktx:1.12.0")
-          }
           EOF
-          
-          cat android/app/build.gradle.kts  # вывести для проверки
-
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.22.0'
-          channel: 'stable'
-          cache: true
 
       - name: Get dependencies
         run: flutter pub get
