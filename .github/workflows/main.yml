@@ -5,7 +5,7 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
-  workflow_dispatch:  # ручной запуск
+  workflow_dispatch:
 
 jobs:
   build-android:
@@ -39,10 +39,7 @@ jobs:
       - name: Build APK (debug)
         run: flutter build apk --debug
 
-      - name: Build APK (release)
-        run: flutter build apk --release
-
-      - name: Build split APKs
+      - name: Build split APKs (release)
         run: flutter build apk --split-per-abi
 
       - name: Upload debug APK
@@ -50,12 +47,6 @@ jobs:
         with:
           name: app-debug
           path: build/app/outputs/flutter-apk/app-debug.apk
-
-      - name: Upload release APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-release
-          path: build/app/outputs/flutter-apk/app-release.apk
 
       - name: Upload split APKs
         uses: actions/upload-artifact@v4
