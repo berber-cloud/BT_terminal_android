@@ -16,6 +16,14 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^2.0.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/app_icon.png"        # путь к вашей иконке
+  adaptive_icon_background: "#FFFFFF"           # фон для Android adaptive icon (можно цвет или изображение)
+  #adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"  # передний план (опционально)
 
 flutter:
   uses-material-design: true
