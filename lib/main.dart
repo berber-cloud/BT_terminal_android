@@ -6,7 +6,11 @@ import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-void main() => runApp(BtTerminalApp());
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  FlutterBluePlus.setLogLevel(LogLevel.verbose, color: true);
+  runApp(BtTerminalApp());
+}
 
 class BtTerminalApp extends StatelessWidget {
   @override
@@ -26,13 +30,12 @@ enum ButtonMode { normal, toggle, hold }
 class ButtonConfig {
   final String id;
   String label;
-  String value;           // основное значение (для normal / hold)
-  String? offValue;       // для toggle – значение при выключении
+  String value;
+  String? offValue;
   Color color;
   ButtonMode mode;
-  int repeatDelayMs;      // для hold (мс)
-  int repeatCount;        // 0 = бесконечно
-  // transient state (не сохраняется)
+  int repeatDelayMs;
+  int repeatCount;
   bool toggleState;
 
   ButtonConfig({
@@ -82,8 +85,9 @@ class _HomeScreenState extends State<HomeScreen> {
   BluetoothCharacteristic? _txCharacteristic;
   BluetoothCharacteristic? _rxCharacteristic;
   List<BluetoothDevice> _devices = [];
-  String _status = 'Not connected';
+  String _status = 'Initializing...';
   bool _connecting = false;
+  bool _bluetoothOn = false;
   String? _lastDeviceAddress;
 
   // Buttons config
@@ -97,6 +101,7 @@ class _HomeScreenState extends State<HomeScreen> {
   StreamSubscription? _scanSubscription;
   StreamSubscription? _connectionSubscription;
   StreamSubscription? _rxSubscription;
+  StreamSubscription? _adapterStateSubscription;
 
   @override
   void initState() {
@@ -111,95 +116,130 @@ class _HomeScreenState extends State<HomeScreen> {
     _scanSubscription?.cancel();
     _connectionSubscription?.cancel();
     _rxSubscription?.cancel();
+    _adapterStateSubscription?.cancel();
     _device?.disconnect();
     super.dispose();
   }
 
   // ---------------- Инициализация Bluetooth ----------------
-  void _initBluetooth() {
-    // Слушаем состояние адаптера
-    FlutterBluePlus.adapterState.listen((state) {
-      if (state == BluetoothAdapterState.on) {
-        _startScan();
-      }
-    });
-    // Если адаптер уже включен — начинаем сканирование
-    if (FlutterBluePlus.adapterStateNow == BluetoothAdapterState.on) {
-      _startScan();
+  Future<void> _initBluetooth() async {
+    try {
+      _adapterStateSubscription = FlutterBluePlus.adapterState.listen((state) {
+        setState(() {
+          _bluetoothOn = state == BluetoothAdapterState.on;
+          if (_bluetoothOn) {
+            _status = 'Ready to scan';
+            _startScan();
+          } else {
+            _status = 'Bluetooth is off';
+          }
+        });
+      });
+
+      final state = await FlutterBluePlus.adapterState.first;
+      setState(() {
+        _bluetoothOn = state == BluetoothAdapterState.on;
+        _status = _bluetoothOn ? 'Ready to scan' : 'Bluetooth is off';
+      });
+
+      if (_bluetoothOn) _startScan();
+    } catch (e) {
+      setState(() => _status = 'Bluetooth init error');
+      debugPrint('Bluetooth init error: $e');
     }
   }
 
   void _startScan() {
-    _devices.clear();
-    FlutterBluePlus.startScan(timeout: const Duration(seconds: 15));
-    _scanSubscription = FlutterBluePlus.onScanResults.listen((results) {
-      for (ScanResult r in results) {
-        if (!_devices.any((d) => d.remoteId == r.device.remoteId)) {
-          setState(() => _devices.add(r.device));
+    if (!_bluetoothOn) return;
+    
+    try {
+      FlutterBluePlus.startScan(timeout: const Duration(seconds: 15));
+      _scanSubscription?.cancel();
+      _scanSubscription = FlutterBluePlus.onScanResults.listen((results) {
+        if (!mounted) return;
+        final newDevices = <BluetoothDevice>[];
+        for (ScanResult r in results) {
+          if (!_devices.any((d) => d.remoteId == r.device.remoteId) &&
+              !newDevices.any((d) => d.remoteId == r.device.remoteId)) {
+            newDevices.add(r.device);
+          }
         }
-      }
-    });
+        if (newDevices.isNotEmpty) {
+          setState(() => _devices.addAll(newDevices));
+        }
+      }, onError: (e) {
+        debugPrint('Scan error: $e');
+      });
+    } catch (e) {
+      debugPrint('Start scan error: $e');
+    }
   }
 
   Future<void> _connectToDevice(BluetoothDevice device) async {
-    if (_device != null) {
-      await _device!.disconnect();
-    }
-    setState(() {
-      _connecting = true;
-      _status = 'Connecting...';
-    });
     try {
-      // Подключаемся
+      if (_device != null) {
+        await _device!.disconnect();
+      }
+      
+      setState(() {
+        _connecting = true;
+        _status = 'Connecting...';
+      });
+
       await device.connect(timeout: const Duration(seconds: 15));
+      
+      if (!mounted) return;
       setState(() {
         _device = device;
         _status = 'Discovering services...';
       });
 
-      // Ищем сервисы
       List<BluetoothService> services = await device.discoverServices();
+      
       BluetoothCharacteristic? tx, rx;
-      // Ищем стандартный UART сервис (UUID: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E)
       for (var service in services) {
         for (var characteristic in service.characteristics) {
-          if (characteristic.uuid.toString() == '6E400002-B5A3-F393-E0A9-E50E24DCCA9E') {
+          if (characteristic.properties.write && !characteristic.properties.writeWithoutResponse) {
+            tx ??= characteristic;
+          }
+          if (characteristic.properties.writeWithoutResponse) {
             tx = characteristic;
-          } else if (characteristic.uuid.toString() == '6E400003-B5A3-F393-E0A9-E50E24DCCA9E') {
-            rx = characteristic;
+          }
+          if (characteristic.properties.notify || characteristic.properties.indicate) {
+            rx ??= characteristic;
           }
         }
       }
-      // Если не нашли, ищем любой write/notify
-      if (tx == null || rx == null) {
-        for (var service in services) {
-          for (var characteristic in service.characteristics) {
-            if (characteristic.properties.write) tx ??= characteristic;
-            if (characteristic.properties.notify) rx ??= characteristic;
-          }
-        }
-      }
+
       if (tx == null) throw 'No writable characteristic found';
 
+      if (!mounted) return;
       setState(() {
         _txCharacteristic = tx;
         _rxCharacteristic = rx;
-        _status = 'Connected to ${device.platformName}';
+        _status = 'Connected to ${device.platformName.isNotEmpty ? device.platformName : device.remoteId}';
         _lastDeviceAddress = device.remoteId.toString();
       });
+      
       _saveLastDevice();
 
-      // Подписываемся на входящие данные
+      _rxSubscription?.cancel();
       if (rx != null) {
-        await rx.setNotifyValue(true);
-        _rxSubscription = rx.onValueReceived.listen((value) {
-          setState(() => _log.add('← ${utf8.decode(value)}'));
-        });
+        try {
+          await rx.setNotifyValue(true);
+          _rxSubscription = rx.onValueReceived.listen((value) {
+            if (!mounted) return;
+            setState(() => _log.add('← ${utf8.decode(value, allowMalformed: true)}'));
+          });
+        } catch (e) {
+          debugPrint('Set notify error: $e');
+        }
       }
 
-      // Отслеживаем отключение
+      _connectionSubscription?.cancel();
       _connectionSubscription = device.connectionState.listen((state) {
-        if (state == BluetoothConnectionState.disconnected && mounted) {
+        if (!mounted) return;
+        if (state == BluetoothConnectionState.disconnected) {
           setState(() {
             _status = 'Disconnected';
             _device = null;
@@ -208,11 +248,13 @@ class _HomeScreenState extends State<HomeScreen> {
           });
         }
       });
+
     } catch (e) {
+      if (!mounted) return;
       setState(() => _status = 'Connection failed');
-      _showError(e.toString());
+      _showError('Connection failed: $e');
     } finally {
-      setState(() => _connecting = false);
+      if (mounted) setState(() => _connecting = false);
     }
   }
 
@@ -221,16 +263,23 @@ class _HomeScreenState extends State<HomeScreen> {
       _showError('No last device saved');
       return;
     }
-    // Ищем устройство в списке
-    final device = _devices.firstWhere(
-      (d) => d.remoteId.toString() == _lastDeviceAddress,
-      orElse: () => throw 'Device not found',
-    );
-    await _connectToDevice(device);
+    try {
+      final device = _devices.firstWhere(
+        (d) => d.remoteId.toString() == _lastDeviceAddress,
+      );
+      await _connectToDevice(device);
+    } catch (e) {
+      _showError('Last device not found. Scan again.');
+    }
   }
 
   void _disconnect() async {
-    await _device?.disconnect();
+    try {
+      await _device?.disconnect();
+    } catch (e) {
+      debugPrint('Disconnect error: $e');
+    }
+    if (!mounted) return;
     setState(() {
       _device = null;
       _txCharacteristic = null;
@@ -244,30 +293,43 @@ class _HomeScreenState extends State<HomeScreen> {
       _showError('Not connected');
       return;
     }
-    await _txCharacteristic!.write(utf8.encode(data));
-    setState(() => _log.add('→ $data'));
+    try {
+      await _txCharacteristic!.write(utf8.encode(data));
+      if (!mounted) return;
+      setState(() => _log.add('→ $data'));
+    } catch (e) {
+      _showError('Send failed: $e');
+    }
   }
 
   // ---------------- Управление кнопками ----------------
   Future<void> _loadButtons() async {
-    final prefs = await SharedPreferences.getInstance();
-    final jsonStr = prefs.getString(_buttonsPrefsKey);
-    if (jsonStr != null) {
-      final list = jsonDecode(jsonStr) as List;
-      setState(() {
-        _buttons = list.map((e) => ButtonConfig.fromJson(e)).toList();
-      });
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final jsonStr = prefs.getString(_buttonsPrefsKey);
+      if (jsonStr != null) {
+        final list = jsonDecode(jsonStr) as List;
+        if (!mounted) return;
+        setState(() {
+          _buttons = list.map((e) => ButtonConfig.fromJson(e)).toList();
+        });
+      }
+    } catch (e) {
+      debugPrint('Load buttons error: $e');
     }
   }
 
   Future<void> _saveButtons() async {
-    final prefs = await SharedPreferences.getInstance();
-    final jsonStr = jsonEncode(_buttons.map((b) => b.toJson()).toList());
-    await prefs.setString(_buttonsPrefsKey, jsonStr);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final jsonStr = jsonEncode(_buttons.map((b) => b.toJson()).toList());
+      await prefs.setString(_buttonsPrefsKey, jsonStr);
+    } catch (e) {
+      debugPrint('Save buttons error: $e');
+    }
   }
 
   void _addButton() => _showButtonEditor(null);
-
   void _editButton(ButtonConfig btn) => _showButtonEditor(btn);
 
   void _deleteButton(ButtonConfig btn) {
@@ -277,18 +339,29 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // ---------------- Last device persistence ----------------
   Future<void> _loadLastDevice() async {
-    final prefs = await SharedPreferences.getInstance();
-    _lastDeviceAddress = prefs.getString('last_device');
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _lastDeviceAddress = prefs.getString('last_device');
+    } catch (e) {
+      debugPrint('Load last device error: $e');
+    }
   }
 
   Future<void> _saveLastDevice() async {
     if (_lastDeviceAddress == null) return;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('last_device', _lastDeviceAddress!);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('last_device', _lastDeviceAddress!);
+    } catch (e) {
+      debugPrint('Save last device error: $e');
+    }
   }
 
   void _showError(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), duration: Duration(seconds: 3)),
+    );
   }
 
   // ---------------- Диалог редактирования кнопки ----------------
@@ -457,11 +530,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                     ),
                     SizedBox(width: 8),
-                    ElevatedButton(
-                      onPressed: () {
-                        // Пусто: отправка только по Enter в данном примере
-                      },
-                      child: Text('Send'),
+                    IconButton(
+                      icon: Icon(Icons.send),
+                      onPressed: () {},
                     ),
                   ],
                 ),
@@ -568,13 +639,24 @@ class _HomeScreenState extends State<HomeScreen> {
         leading: PopupMenuButton<BluetoothDevice>(
           icon: Icon(Icons.bluetooth),
           tooltip: 'Select device',
-          onSelected: (device) => _connectToDevice(device),
-          itemBuilder: (ctx) => _devices.map((d) => PopupMenuItem(
-            value: d,
-            child: Text(d.platformName.isEmpty ? d.remoteId.toString() : d.platformName),
-          )).toList(),
+          onSelected: _connectToDevice,
+          itemBuilder: (ctx) => _devices.isEmpty
+              ? [PopupMenuItem(value: null, child: Text('No devices found'), enabled: false)]
+              : _devices.map((d) => PopupMenuItem(
+                    value: d,
+                    child: Text(d.platformName.isNotEmpty ? d.platformName : d.remoteId.toString()),
+                  )).toList(),
         ),
         actions: [
+          if (_bluetoothOn)
+            IconButton(
+              icon: Icon(Icons.refresh),
+              tooltip: 'Scan again',
+              onPressed: () {
+                _devices.clear();
+                _startScan();
+              },
+            ),
           IconButton(
             icon: Icon(Icons.replay),
             tooltip: 'Connect last device',
@@ -596,7 +678,7 @@ class _HomeScreenState extends State<HomeScreen> {
           preferredSize: Size.fromHeight(4),
           child: _connecting
               ? LinearProgressIndicator()
-              : Container(height: 4, color: _device != null ? Colors.green : Colors.red),
+              : Container(height: 4, color: _device != null ? Colors.green : (_bluetoothOn ? Colors.blue : Colors.red)),
         ),
       ),
       body: Column(
@@ -605,24 +687,49 @@ class _HomeScreenState extends State<HomeScreen> {
             padding: const EdgeInsets.all(8.0),
             child: Text(_status, style: TextStyle(fontSize: 12, color: Colors.grey)),
           ),
-          Expanded(
-            child: _buttons.isEmpty
-                ? Center(child: Text('No buttons. Tap "+" to add.'))
-                : GridView.builder(
-                    padding: EdgeInsets.all(8),
-                    gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
-                      maxCrossAxisExtent: 150,
-                      crossAxisSpacing: 12,
-                      mainAxisSpacing: 12,
-                      childAspectRatio: 1.5,
+          if (!_bluetoothOn)
+            Expanded(
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.bluetooth_disabled, size: 64, color: Colors.red),
+                    SizedBox(height: 16),
+                    Text('Bluetooth is off', style: TextStyle(fontSize: 18)),
+                    SizedBox(height: 8),
+                    ElevatedButton(
+                      onPressed: () async {
+                        try {
+                          await FlutterBluePlus.turnOn();
+                        } catch (e) {
+                          _showError('Cannot turn on Bluetooth: $e');
+                        }
+                      },
+                      child: Text('Turn On Bluetooth'),
                     ),
-                    itemCount: _buttons.length,
-                    itemBuilder: (ctx, i) => GestureDetector(
-                      onLongPress: () => _editButton(_buttons[i]),
-                      child: _buildActionButton(_buttons[i]),
+                  ],
+                ),
+              ),
+            )
+          else
+            Expanded(
+              child: _buttons.isEmpty
+                  ? Center(child: Text('No buttons. Tap "+" to add.'))
+                  : GridView.builder(
+                      padding: EdgeInsets.all(8),
+                      gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
+                        maxCrossAxisExtent: 150,
+                        crossAxisSpacing: 12,
+                        mainAxisSpacing: 12,
+                        childAspectRatio: 1.5,
+                      ),
+                      itemCount: _buttons.length,
+                      itemBuilder: (ctx, i) => GestureDetector(
+                        onLongPress: () => _editButton(_buttons[i]),
+                        child: _buildActionButton(_buttons[i]),
+                      ),
                     ),
-                  ),
-          ),
+            ),
         ],
       ),
       floatingActionButton: FloatingActionButton(
