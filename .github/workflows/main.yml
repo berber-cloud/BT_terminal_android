@@ -39,15 +39,15 @@ jobs:
 
       - name: Patch build.gradle.kts
         run: |
-          # Fix jvmTarget
+          # Исправляем jvmTarget
           sed -i 's/jvmTarget = JavaVersion.VERSION_17.toString()/jvmTarget = "17"/g' android/app/build.gradle.kts
-          # Fix versionCode and versionName (replace flutter.versionCode with 1 and flutter.versionName with "1.0.0")
+          # Заменяем flutter.versionCode / flutter.versionName на константы
           sed -i 's/versionCode = flutter\.versionCode/versionCode = 1/g' android/app/build.gradle.kts
           sed -i 's/versionName = flutter\.versionName/versionName = "1.0.0"/g' android/app/build.gradle.kts
-          # If there is no minSdk setting, add it under defaultConfig
+          # Добавляем minSdk, если его нет
           grep -q 'minSdk' android/app/build.gradle.kts || \
             sed -i '/defaultConfig {/a\        minSdk = 23' android/app/build.gradle.kts
-          # Print file for debugging
+          # Показываем итоговый файл для отладки
           cat android/app/build.gradle.kts
 
       - name: Get dependencies
